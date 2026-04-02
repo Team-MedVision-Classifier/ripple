@@ -126,47 +126,87 @@ def process_foci_pipeline(gray_img, denoise_h, tophat_size, clip_limit, min_area
     return final, clean_mask
 
 
-def count_foci_per_cell(foci_mask, cell_mask):
-    """Count the number of distinct foci in each segmented cell.
+def classify_per_cell(gray, cell_mask, denoise_h, tophat_size, clip_limit, min_area,
+                      damage_threshold, save_foci_mask, image_path):
+    """Extract each cell patch, run the foci pipeline on it individually,
+    count foci, and classify.
 
-    Args:
-        foci_mask: Binary uint8 image (255 = foci pixel).
-        cell_mask: Label image from segmentation (0 = background, >0 = cell label).
+    This mirrors how DINO works: each cell is processed in isolation so the
+    pipeline parameters (denoising, CLAHE, etc.) adapt to each cell's content
+    rather than the global image.
 
     Returns:
-        dict mapping cell_label -> {foci_count, bbox}.
+        (results_list, composite_foci_mask or None)
     """
-    # Label connected components in the foci mask
-    foci_labels = measure.label(foci_mask > 0, connectivity=2)
+    img_h, img_w = gray.shape[:2]
 
     cell_labels = np.unique(cell_mask)
     cell_labels = cell_labels[cell_labels > 0]
 
-    results = {}
-    for cell_label in cell_labels:
-        cell_region = (cell_mask == cell_label)
+    if len(cell_labels) == 0:
+        return [], None
 
-        # Find bounding box
-        ys, xs = np.where(cell_region)
+    # Composite foci mask (same size as original image) for visualization
+    composite_foci_mask = np.zeros((img_h, img_w), dtype=np.uint8) if save_foci_mask else None
+
+    results = []
+    for cell_label in cell_labels:
+        # Find bounding box for this cell
+        ys, xs = np.where(cell_mask == cell_label)
         if len(ys) == 0:
             continue
         min_x, max_x = int(xs.min()), int(xs.max())
         min_y, max_y = int(ys.min()), int(ys.max())
 
-        # Count distinct foci overlapping this cell
-        foci_in_cell = foci_labels[cell_region]
-        foci_in_cell = foci_in_cell[foci_in_cell > 0]
-        unique_foci = len(np.unique(foci_in_cell))
+        # Add padding (10% of bbox size, clamped to image bounds)
+        pad_x = max(int((max_x - min_x) * 0.1), 2)
+        pad_y = max(int((max_y - min_y) * 0.1), 2)
+        x0 = max(0, min_x - pad_x)
+        y0 = max(0, min_y - pad_y)
+        x1 = min(img_w, max_x + pad_x + 1)
+        y1 = min(img_h, max_y + pad_y + 1)
 
-        results[int(cell_label)] = {
-            "foci_count": unique_foci,
+        # Extract cell patch from the grayscale image
+        cell_patch = gray[y0:y1, x0:x1].copy()
+
+        # Create a cell-only mask for this patch (zero out pixels outside this cell)
+        cell_region_patch = cell_mask[y0:y1, x0:x1]
+        cell_only_mask = (cell_region_patch == cell_label).astype(np.uint8) * 255
+
+        # Apply the cell mask to the patch so only this cell's pixels are processed
+        cell_patch = cv.bitwise_and(cell_patch, cell_patch, mask=cell_only_mask)
+
+        # Run foci pipeline on the individual cell patch
+        _, patch_foci_mask = process_foci_pipeline(
+            cell_patch, denoise_h, tophat_size, clip_limit, min_area
+        )
+
+        # Mask foci to only within this cell's boundary
+        patch_foci_mask = cv.bitwise_and(patch_foci_mask, cell_only_mask)
+
+        # Count distinct foci in this cell's patch
+        foci_labels = measure.label(patch_foci_mask > 0, connectivity=2)
+        foci_count = foci_labels.max()  # number of connected components
+
+        # Paste cell's foci mask back into the composite
+        if composite_foci_mask is not None:
+            composite_foci_mask[y0:y1, x0:x1] = np.maximum(
+                composite_foci_mask[y0:y1, x0:x1], patch_foci_mask
+            )
+
+        prediction = "Damaged" if foci_count >= damage_threshold else "Healthy"
+        results.append({
+            "label": int(cell_label),
+            "prediction": prediction,
+            "foci_count": int(foci_count),
+            "probability": foci_count / max(damage_threshold * 2, 1),
             "bbox": {
                 "min_x": min_x, "min_y": min_y,
                 "max_x": max_x, "max_y": max_y
             }
-        }
+        })
 
-    return results
+    return results, composite_foci_mask
 
 
 def main():
@@ -199,28 +239,27 @@ def main():
         print(json.dumps({"error": f"Failed to load mask: {str(e)}"}))
         sys.exit(1)
 
-    # Run foci isolation pipeline
-    print(f"[threshold] Pipeline: denoise_h={args.denoise_h}, tophat={args.tophat_size}, "
-          f"clip={args.clip_limit}, min_area={args.min_area}", file=sys.stderr)
+    # Run per-cell classification
+    print(f"[threshold] Per-cell pipeline: denoise_h={args.denoise_h}, tophat={args.tophat_size}, "
+          f"clip={args.clip_limit}, min_area={args.min_area}, "
+          f"damage_threshold={args.damage_threshold}", file=sys.stderr)
 
-    final_img, foci_mask = process_foci_pipeline(
-        gray, args.denoise_h, args.tophat_size, args.clip_limit, args.min_area
+    results, composite_foci_mask = classify_per_cell(
+        gray, cell_mask,
+        args.denoise_h, args.tophat_size, args.clip_limit, args.min_area,
+        args.damage_threshold, args.save_foci_mask, args.image_path
     )
 
-    # Save foci mask if requested
+    # Save composite foci mask in the same directory as the segmentation mask (outputs folder)
     foci_mask_path = None
-    if args.save_foci_mask:
-        base = os.path.splitext(args.mask_path)[0]
-        # Save next to the original image, not the mask
-        img_base = os.path.splitext(args.image_path)[0]
-        foci_mask_path = img_base + "_foci_mask.png"
-        cv.imwrite(foci_mask_path, foci_mask)
-        print(f"[threshold] Saved foci mask: {foci_mask_path}", file=sys.stderr)
+    if args.save_foci_mask and composite_foci_mask is not None:
+        mask_dir = os.path.dirname(args.mask_path)
+        img_name = os.path.splitext(os.path.basename(args.image_path))[0]
+        foci_mask_path = os.path.join(mask_dir, img_name + "_foci_mask.png")
+        cv.imwrite(foci_mask_path, composite_foci_mask)
+        print(f"[threshold] Saved composite foci mask: {foci_mask_path}", file=sys.stderr)
 
-    # Count foci per cell
-    cell_foci = count_foci_per_cell(foci_mask, cell_mask)
-
-    if not cell_foci:
+    if not results:
         output = {
             "cells": [],
             "summary": {"total": 0, "healthy": 0, "damaged": 0}
@@ -229,19 +268,6 @@ def main():
             output["foci_mask_path"] = foci_mask_path
         print(json.dumps(output))
         return
-
-    # Classify based on damage threshold
-    results = []
-    for label, info in sorted(cell_foci.items()):
-        foci_count = info["foci_count"]
-        prediction = "Damaged" if foci_count >= args.damage_threshold else "Healthy"
-        results.append({
-            "label": label,
-            "prediction": prediction,
-            "foci_count": foci_count,
-            "probability": foci_count / max(args.damage_threshold * 2, 1),
-            "bbox": info["bbox"]
-        })
 
     healthy_count = sum(1 for r in results if r["prediction"] == "Healthy")
     damaged_count = sum(1 for r in results if r["prediction"] == "Damaged")
