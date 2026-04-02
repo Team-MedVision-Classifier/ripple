@@ -9,3 +9,4 @@ fastapi[standard]
 uvicorn
 python-multipart
 timm
+scikit-image

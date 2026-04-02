@@ -131,17 +131,33 @@ public class CellposeFrontendUI {
     // Color map for mask visualization
     private Color[] colorMap;
 
-    // Classification components
-    private JComboBox<String> classificationModelCombo;
+    // Classification components — shared
+    private JComboBox<String> classificationMethodCombo;
     private JSpinner fociChannelSpinner;
     private JButton classifyButton;
     private JCheckBox showClassificationCheckbox;
     private JCheckBox showLabelsCheckbox;
+    private JCheckBox showFociMaskCheckbox;
     private JLabel classificationSummaryLabel;
     private BufferedImage classificationOverlay;
+    private BufferedImage fociMaskImage;
     private boolean showClassification = true;
     private boolean showLabels = false;
+    private boolean showFociMask = false;
     private File lastSavedMaskFile;
+    private JPanel methodOptionsCards;
+    private CardLayout methodOptionsLayout;
+
+    // DINO-specific
+    private JComboBox<String> classificationModelCombo;
+
+    // Threshold-specific
+    private JSpinner denoiseHSpinner;
+    private JSpinner tophatSizeSpinner;
+    private JSpinner clipLimitSpinner;
+    private JSpinner minAreaSpinner;
+    private JSpinner damageThresholdSpinner;
+
     // Maps cell label -> classification result: {prediction, probability, bbox}
     private Map<Integer, JSONObject> classificationResults = new HashMap<>();
     // Maps cell label -> centroid (x,y) from segmentation mask; available after segmentation
@@ -335,22 +351,64 @@ public class CellposeFrontendUI {
         panel.add(Box.createRigidArea(new Dimension(0, 10)));
 
         // Classification section
-        JPanel classificationPanel = createSection("Foci Classification (DINO)");
+        JPanel classificationPanel = createSection("Foci Classification");
 
-        classificationModelCombo = new JComboBox<>();
-        addLabeledComponent(classificationPanel, "Classification Model:", classificationModelCombo);
+        // Method selector
+        classificationMethodCombo = new JComboBox<>(new String[]{"DINO", "Threshold"});
+        addLabeledComponent(classificationPanel, "Method:", classificationMethodCombo);
 
-        // Foci channel selector: -1 = auto, 0,1,2,... = specific channel
+        // Foci channel (shared between both methods)
         fociChannelSpinner = new JSpinner(new SpinnerNumberModel(-1, -1, 20, 1));
         fociChannelSpinner.setToolTipText(
             "Channel containing foci (-1 = auto/default, 0 = first channel, 1 = second channel, ...)");
         addLabeledComponent(classificationPanel, "Foci Channel:", fociChannelSpinner);
 
+        // Card layout for method-specific options
+        methodOptionsLayout = new CardLayout();
+        methodOptionsCards = new JPanel(methodOptionsLayout);
+        methodOptionsCards.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        // --- DINO options card ---
+        JPanel dinoOptionsPanel = new JPanel();
+        dinoOptionsPanel.setLayout(new BoxLayout(dinoOptionsPanel, BoxLayout.Y_AXIS));
+        classificationModelCombo = new JComboBox<>();
+        addLabeledComponent(dinoOptionsPanel, "Model:", classificationModelCombo);
         JButton refreshClassModelsBtn = new JButton("Refresh Models");
         refreshClassModelsBtn.addActionListener(e -> loadClassificationModels());
         refreshClassModelsBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
+        dinoOptionsPanel.add(refreshClassModelsBtn);
+        methodOptionsCards.add(dinoOptionsPanel, "DINO");
+
+        // --- Threshold options card ---
+        JPanel thresholdOptionsPanel = new JPanel();
+        thresholdOptionsPanel.setLayout(new BoxLayout(thresholdOptionsPanel, BoxLayout.Y_AXIS));
+        denoiseHSpinner = new JSpinner(new SpinnerNumberModel(15, 0, 50, 1));
+        denoiseHSpinner.setToolTipText("NLM Denoising strength (0 = disabled)");
+        addLabeledComponent(thresholdOptionsPanel, "Denoise H:", denoiseHSpinner);
+        tophatSizeSpinner = new JSpinner(new SpinnerNumberModel(13, 3, 51, 2));
+        tophatSizeSpinner.setToolTipText("Top-Hat kernel size (odd, controls max foci size to isolate)");
+        addLabeledComponent(thresholdOptionsPanel, "TopHat Size:", tophatSizeSpinner);
+        clipLimitSpinner = new JSpinner(new SpinnerNumberModel(6.0, 0.1, 20.0, 0.5));
+        clipLimitSpinner.setToolTipText("CLAHE clip limit for contrast enhancement");
+        addLabeledComponent(thresholdOptionsPanel, "CLAHE Clip Limit:", clipLimitSpinner);
+        minAreaSpinner = new JSpinner(new SpinnerNumberModel(11, 0, 500, 1));
+        minAreaSpinner.setToolTipText("Minimum foci area in pixels (smaller spots are removed)");
+        addLabeledComponent(thresholdOptionsPanel, "Min Foci Area (px):", minAreaSpinner);
+        damageThresholdSpinner = new JSpinner(new SpinnerNumberModel(5, 1, 100, 1));
+        damageThresholdSpinner.setToolTipText("If a cell has >= this many foci, it is classified as Damaged");
+        addLabeledComponent(thresholdOptionsPanel, "Damage Threshold:", damageThresholdSpinner);
+        methodOptionsCards.add(thresholdOptionsPanel, "Threshold");
+
         classificationPanel.add(Box.createRigidArea(new Dimension(0, 5)));
-        classificationPanel.add(refreshClassModelsBtn);
+        classificationPanel.add(methodOptionsCards);
+
+        // Switch cards when method changes
+        classificationMethodCombo.addActionListener(e -> {
+            String selected = (String) classificationMethodCombo.getSelectedItem();
+            if (selected != null) {
+                methodOptionsLayout.show(methodOptionsCards, selected);
+            }
+        });
 
         classificationPanel.add(Box.createRigidArea(new Dimension(0, 10)));
 
@@ -370,7 +428,7 @@ public class CellposeFrontendUI {
         panel.add(classificationPanel);
         panel.add(Box.createRigidArea(new Dimension(0, 10)));
 
-        // Display settings (after classification so all overlay options are together)
+        // Display settings
         JPanel displaySettingsPanel = createSection("Display Settings");
 
         showMaskCheckbox = new JCheckBox("Show Mask Overlay", true);
@@ -393,6 +451,14 @@ public class CellposeFrontendUI {
             updateDisplay();
         });
         displaySettingsPanel.add(showLabelsCheckbox);
+
+        showFociMaskCheckbox = new JCheckBox("Show Foci Mask", false);
+        showFociMaskCheckbox.setToolTipText("Show detected foci from threshold method");
+        showFociMaskCheckbox.addActionListener(e -> {
+            showFociMask = showFociMaskCheckbox.isSelected();
+            updateDisplay();
+        });
+        displaySettingsPanel.add(showFociMaskCheckbox);
 
         displaySettingsPanel.add(Box.createRigidArea(new Dimension(0, 10)));
         displaySettingsPanel.add(new JLabel("Mask Opacity:"));
@@ -786,6 +852,7 @@ public class CellposeFrontendUI {
                 currentImageFile = file;
                 maskImage = null;
                 classificationOverlay = null;
+                fociMaskImage = null;
                 classificationResults.clear();
                 cellCentroids.clear();
                 if (classificationSummaryLabel != null) {
@@ -1350,6 +1417,24 @@ public class CellposeFrontendUI {
             g.drawImage(classificationOverlay, 0, 0, null);
         }
 
+        // Overlay foci mask (from threshold method) if available and enabled
+        if (fociMaskImage != null && showFociMask) {
+            g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.7f));
+            // Render foci mask in cyan so it's distinct from green/red classification
+            int fw = fociMaskImage.getWidth();
+            int fh = fociMaskImage.getHeight();
+            BufferedImage fociColored = new BufferedImage(fw, fh, BufferedImage.TYPE_INT_ARGB);
+            for (int fy = 0; fy < fh; fy++) {
+                for (int fx = 0; fx < fw; fx++) {
+                    int pixel = fociMaskImage.getRGB(fx, fy) & 0xFF;
+                    if (pixel > 0) {
+                        fociColored.setRGB(fx, fy, new Color(0, 255, 255, 200).getRGB());
+                    }
+                }
+            }
+            g.drawImage(fociColored, 0, 0, null);
+        }
+
         // Draw cell label numbers at each cell's centroid (available after segmentation)
         if (showLabels && !cellCentroids.isEmpty()) {
             g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 1.0f));
@@ -1505,7 +1590,6 @@ public class CellposeFrontendUI {
             return;
         }
 
-        // Find the mask file for the current image
         File maskFile = findMaskFileForCurrentImage();
         if (maskFile == null || !maskFile.exists()) {
             JOptionPane.showMessageDialog(frame,
@@ -1514,6 +1598,17 @@ public class CellposeFrontendUI {
             return;
         }
 
+        String method = (String) classificationMethodCombo.getSelectedItem();
+        int fociChannel = ((Number) fociChannelSpinner.getValue()).intValue();
+
+        if ("DINO".equals(method)) {
+            runDinoClassification(maskFile, fociChannel);
+        } else {
+            runThresholdClassification(maskFile, fociChannel);
+        }
+    }
+
+    private void runDinoClassification(File maskFile, int fociChannel) {
         String selectedModel = (String) classificationModelCombo.getSelectedItem();
         if (selectedModel == null || selectedModel.startsWith("(")) {
             JOptionPane.showMessageDialog(frame,
@@ -1532,16 +1627,14 @@ public class CellposeFrontendUI {
             return;
         }
 
-        int fociChannel = ((Number) fociChannelSpinner.getValue()).intValue();
-
         classifyButton.setEnabled(false);
-        statusLabel.setText(" Running DINO foci classification (channel=" + fociChannel + ")...");
+        statusLabel.setText(" Running DINO classification (channel=" + fociChannel + ")...");
         classificationSummaryLabel.setText("Classifying...");
 
         SwingWorker<JSONObject, String> worker = new SwingWorker<>() {
             @Override
             protected JSONObject doInBackground() throws Exception {
-                return executeClassification(
+                return executeDinoClassification(
                     currentImageFile, maskFile, modelPath.toFile(), fociChannel
                 );
             }
@@ -1549,59 +1642,106 @@ public class CellposeFrontendUI {
             @Override
             protected void done() {
                 try {
-                    JSONObject result = get();
-
-                    if (result.has("error")) {
-                        String err = result.getString("error");
-                        statusLabel.setText(" Classification failed: " + err);
-                        classificationSummaryLabel.setText("Error: " + err);
-                        JOptionPane.showMessageDialog(frame,
-                            "Classification error:\n" + err,
-                            "Error", JOptionPane.ERROR_MESSAGE);
-                    } else {
-                        JSONObject summary = result.getJSONObject("summary");
-                        int total = summary.getInt("total");
-                        int healthy = summary.getInt("healthy");
-                        int damaged = summary.getInt("damaged");
-
-                        // Store per-cell results
-                        classificationResults.clear();
-                        JSONArray cells = result.getJSONArray("cells");
-                        for (int i = 0; i < cells.length(); i++) {
-                            JSONObject cell = cells.getJSONObject(i);
-                            classificationResults.put(cell.getInt("label"), cell);
-                        }
-
-                        // Build classification overlay
-                        buildClassificationOverlay(maskFile);
-
-                        String summaryText = String.format(
-                            "Total: %d | Healthy: %d | Damaged: %d",
-                            total, healthy, damaged
-                        );
-                        classificationSummaryLabel.setText(summaryText);
-                        statusLabel.setText(" Classification complete: " + summaryText);
-
-                        // Save classification results CSV
-                        saveClassificationCsv(currentImageFile, result);
-
-                        updateDisplay();
-                    }
+                    processClassificationResult(get(), maskFile);
                 } catch (Exception e) {
                     statusLabel.setText(" Classification failed: " + e.getMessage());
                     classificationSummaryLabel.setText("Error");
                     e.printStackTrace();
+                    classifyButton.setEnabled(true);
                 }
-                classifyButton.setEnabled(true);
             }
         };
         worker.execute();
     }
 
+    private void runThresholdClassification(File maskFile, int fociChannel) {
+        int denoiseH = ((Number) denoiseHSpinner.getValue()).intValue();
+        int tophatSize = ((Number) tophatSizeSpinner.getValue()).intValue();
+        double clipLimit = ((Number) clipLimitSpinner.getValue()).doubleValue();
+        int minArea = ((Number) minAreaSpinner.getValue()).intValue();
+        int damageThreshold = ((Number) damageThresholdSpinner.getValue()).intValue();
+
+        classifyButton.setEnabled(false);
+        statusLabel.setText(" Running threshold classification (channel=" + fociChannel + ")...");
+        classificationSummaryLabel.setText("Classifying...");
+
+        SwingWorker<JSONObject, String> worker = new SwingWorker<>() {
+            @Override
+            protected JSONObject doInBackground() throws Exception {
+                return executeThresholdClassification(
+                    currentImageFile, maskFile, fociChannel,
+                    denoiseH, tophatSize, clipLimit, minArea, damageThreshold
+                );
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    processClassificationResult(get(), maskFile);
+                } catch (Exception e) {
+                    statusLabel.setText(" Classification failed: " + e.getMessage());
+                    classificationSummaryLabel.setText("Error");
+                    e.printStackTrace();
+                    classifyButton.setEnabled(true);
+                }
+            }
+        };
+        worker.execute();
+    }
+
+    private void processClassificationResult(JSONObject result, File maskFile) {
+        if (result.has("error")) {
+            String err = result.getString("error");
+            statusLabel.setText(" Classification failed: " + err);
+            classificationSummaryLabel.setText("Error: " + err);
+            JOptionPane.showMessageDialog(frame,
+                "Classification error:\n" + err,
+                "Error", JOptionPane.ERROR_MESSAGE);
+        } else {
+            JSONObject summary = result.getJSONObject("summary");
+            int total = summary.getInt("total");
+            int healthy = summary.getInt("healthy");
+            int damaged = summary.getInt("damaged");
+
+            classificationResults.clear();
+            JSONArray cells = result.getJSONArray("cells");
+            for (int i = 0; i < cells.length(); i++) {
+                JSONObject cell = cells.getJSONObject(i);
+                classificationResults.put(cell.getInt("label"), cell);
+            }
+
+            buildClassificationOverlay(maskFile);
+
+            // Load foci mask if available (threshold method)
+            fociMaskImage = null;
+            if (result.has("foci_mask_path")) {
+                try {
+                    File fociMaskFile = new File(result.getString("foci_mask_path"));
+                    if (fociMaskFile.exists()) {
+                        fociMaskImage = ImageIO.read(fociMaskFile);
+                    }
+                } catch (Exception e) {
+                    System.err.println("[Classify] Failed to load foci mask: " + e.getMessage());
+                }
+            }
+
+            String summaryText = String.format(
+                "Total: %d | Healthy: %d | Damaged: %d",
+                total, healthy, damaged
+            );
+            classificationSummaryLabel.setText(summaryText);
+            statusLabel.setText(" Classification complete: " + summaryText);
+
+            saveClassificationCsv(currentImageFile, result);
+            updateDisplay();
+        }
+        classifyButton.setEnabled(true);
+    }
+
     /**
      * Execute the Python classification script.
      */
-    private JSONObject executeClassification(File imageFile, File maskFile, File modelFile, int fociChannel) throws Exception {
+    private JSONObject executeDinoClassification(File imageFile, File maskFile, File modelFile, int fociChannel) throws Exception {
         // Use venv_v4 python (has torch)
         String pythonExe = getPythonExecutable("CellposeSAM");  // venv_v4
         if (pythonExe == null) {
@@ -1680,8 +1820,92 @@ public class CellposeFrontendUI {
     }
 
     /**
-     * Find the mask file corresponding to the current image.
+     * Execute the threshold-based classification Python script.
      */
+    private JSONObject executeThresholdClassification(
+            File imageFile, File maskFile, int fociChannel,
+            int denoiseH, int tophatSize, double clipLimit,
+            int minArea, int damageThreshold) throws Exception {
+
+        // Use venv_v3 python (has opencv/skimage), fall back to venv_v4
+        String pythonExe = getPythonExecutable("Cellpose3.1");
+        if (pythonExe == null) {
+            pythonExe = getPythonExecutable("CellposeSAM");
+        }
+        if (pythonExe == null) {
+            return new JSONObject().put("error", "Python executable not found");
+        }
+
+        Path scriptPath = backendDir.resolve("cellpose backend").resolve("classify_foci_threshold.py");
+        if (!scriptPath.toFile().exists()) {
+            return new JSONObject().put("error", "classify_foci_threshold.py not found at: " + scriptPath);
+        }
+
+        List<String> command = new ArrayList<>();
+        command.add(pythonExe);
+        command.add(scriptPath.toString());
+        command.add("--image_path");
+        command.add(imageFile.getAbsolutePath());
+        command.add("--mask_path");
+        command.add(maskFile.getAbsolutePath());
+        command.add("--foci_channel");
+        command.add(String.valueOf(fociChannel));
+        command.add("--denoise_h");
+        command.add(String.valueOf(denoiseH));
+        command.add("--tophat_size");
+        command.add(String.valueOf(tophatSize));
+        command.add("--clip_limit");
+        command.add(String.valueOf(clipLimit));
+        command.add("--min_area");
+        command.add(String.valueOf(minArea));
+        command.add("--damage_threshold");
+        command.add(String.valueOf(damageThreshold));
+        command.add("--save_foci_mask");
+
+        System.out.println("[Threshold Classify] Executing: " + String.join(" ", command));
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.directory(backendDir.resolve("cellpose backend").toFile());
+        pb.redirectErrorStream(false);
+
+        Process process = pb.start();
+
+        BufferedReader stdoutReader = new BufferedReader(
+            new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
+        StringBuilder jsonOutput = new StringBuilder();
+        String line;
+        while ((line = stdoutReader.readLine()) != null) {
+            jsonOutput.append(line);
+        }
+        stdoutReader.close();
+
+        BufferedReader stderrReader = new BufferedReader(
+            new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8));
+        StringBuilder stderrOutput = new StringBuilder();
+        while ((line = stderrReader.readLine()) != null) {
+            stderrOutput.append(line).append("\n");
+            System.out.println("[Threshold Classify stderr] " + line);
+        }
+        stderrReader.close();
+
+        int exitCode = process.waitFor();
+        System.out.println("[Threshold Classify] Exit code: " + exitCode);
+
+        if (jsonOutput.length() == 0) {
+            String errorMsg = stderrOutput.length() > 0
+                ? stderrOutput.toString().trim()
+                : "No output from threshold script (exit code " + exitCode + ")";
+            return new JSONObject().put("error", errorMsg);
+        }
+
+        try {
+            return new JSONObject(jsonOutput.toString());
+        } catch (Exception e) {
+            return new JSONObject().put("error",
+                "Invalid JSON output: " + jsonOutput.toString().substring(0, Math.min(200, jsonOutput.length())));
+        }
+    }
+
     /**
      * Compute cell centroids from a segmentation mask image.
      * Scans the label image and calculates the mean (x, y) for each label.
