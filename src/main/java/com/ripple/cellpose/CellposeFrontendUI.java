@@ -36,6 +36,10 @@ public class CellposeFrontendUI {
         int area;
         long sumX;
         long sumY;
+        // Second-order moment accumulators (for eccentricity)
+        double sumXX;
+        double sumYY;
+        double sumXY;
         int minX = Integer.MAX_VALUE;
         int minY = Integer.MAX_VALUE;
         int maxX = Integer.MIN_VALUE;
@@ -70,6 +74,67 @@ public class CellposeFrontendUI {
 
         double centroidY() {
             return area > 0 ? (double) sumY / area : 0.0;
+        }
+
+        /** Equivalent diameter = diameter of a circle with the same area. */
+        double equivalentDiameter() {
+            return area > 0 ? Math.sqrt(4.0 * area / Math.PI) : 0.0;
+        }
+
+        /**
+         * Eccentricity from the inertia tensor eigenvalues.
+         * Must call computeCentralMoments() before this.
+         * Returns 0 for a perfect circle, approaches 1 for elongated shapes.
+         */
+        double eccentricity() {
+            if (area <= 1) {
+                return 0.0;
+            }
+            double cx = centroidX();
+            double cy = centroidY();
+            double mu20 = sumXX / area - cx * cx;
+            double mu02 = sumYY / area - cy * cy;
+            double mu11 = sumXY / area - cx * cy;
+
+            double diff = mu20 - mu02;
+            double root = Math.sqrt(diff * diff + 4.0 * mu11 * mu11);
+            double lambda1 = (mu20 + mu02 + root) / 2.0;
+            double lambda2 = (mu20 + mu02 - root) / 2.0;
+
+            if (lambda1 <= 0.0) {
+                return 0.0;
+            }
+            return Math.sqrt(1.0 - lambda2 / lambda1);
+        }
+    }
+
+    /**
+     * Per-image summary stats returned by writeMaskPropertiesCsv.
+     */
+    private static class ImageCellStats {
+        final String imageName;
+        final int cellCount;
+        final double avgArea;
+        final double minArea;
+        final double maxArea;
+        final double avgDiameter;
+        final double minDiameter;
+        final double maxDiameter;
+        final double avgEccentricity;
+
+        ImageCellStats(String imageName, int cellCount,
+                       double avgArea, double minArea, double maxArea,
+                       double avgDiameter, double minDiameter, double maxDiameter,
+                       double avgEccentricity) {
+            this.imageName = imageName;
+            this.cellCount = cellCount;
+            this.avgArea = avgArea;
+            this.minArea = minArea;
+            this.maxArea = maxArea;
+            this.avgDiameter = avgDiameter;
+            this.minDiameter = minDiameter;
+            this.maxDiameter = maxDiameter;
+            this.avgEccentricity = avgEccentricity;
         }
     }
 
@@ -944,6 +1009,7 @@ public class CellposeFrontendUI {
 
                 publish("Initializing " + modelType + "/" + modelName + "...");
 
+                List<ImageCellStats> allImageStats = new ArrayList<>();
                 BufferedImage previewMask = null;
                 int total = taskFiles.size();
                 for (int i = 0; i < total; i++) {
@@ -971,7 +1037,8 @@ public class CellposeFrontendUI {
                     File outputMaskFile = buildMaskOutputFile(imageFile);
                     ImageIO.write(result.rawMask, "png", outputMaskFile);
                     File outputPropertiesFile = buildMaskPropertiesOutputFile(imageFile);
-                    writeMaskPropertiesCsv(result.rawMask, outputPropertiesFile);
+                    ImageCellStats imgStats = writeMaskPropertiesCsv(result.rawMask, outputPropertiesFile, imageFile.getName());
+                    allImageStats.add(imgStats);
                     savedMasksCount++;
                     publish("Saved " + outputMaskFile.getName() + " and "
                         + outputPropertiesFile.getName() + " (" + result.numCells + " cells)");
@@ -981,6 +1048,13 @@ public class CellposeFrontendUI {
                     } else if (previewMask == null) {
                         previewMask = result.coloredMask;
                     }
+                }
+
+                // Write overall_properties.csv at the outputs/ folder level
+                if (!allImageStats.isEmpty() && taskIsFolderBatch) {
+                    File outputsRoot = getOutputsRootDir(taskFiles.get(0));
+                    writeOverallPropertiesCsv(allImageStats, new File(outputsRoot, "overall_properties.csv"));
+                    publish("Saved overall_properties.csv");
                 }
 
                 return previewMask;
@@ -1055,27 +1129,55 @@ public class CellposeFrontendUI {
         return files;
     }
 
+    /**
+     * Get the per-image output directory: outputs/<image_base_name>/
+     * Created next to the image (or next to the folder).
+     */
+    private File getImageOutputDir(File imageFile) {
+        String name = imageFile.getName();
+        int dot = name.lastIndexOf('.');
+        String base = dot > 0 ? name.substring(0, dot) : name;
+        File outputsRoot = new File(imageFile.getParentFile(), "outputs");
+        File imageOutputDir = new File(outputsRoot, base);
+        if (!imageOutputDir.exists()) {
+            imageOutputDir.mkdirs();
+        }
+        return imageOutputDir;
+    }
+
+    /**
+     * Get the outputs root directory (for overall_properties.csv).
+     */
+    private File getOutputsRootDir(File anyImageFile) {
+        File outputsRoot = new File(anyImageFile.getParentFile(), "outputs");
+        if (!outputsRoot.exists()) {
+            outputsRoot.mkdirs();
+        }
+        return outputsRoot;
+    }
+
     private File buildMaskOutputFile(File imageFile) {
         String name = imageFile.getName();
         int dot = name.lastIndexOf('.');
         String base = dot > 0 ? name.substring(0, dot) : name;
-        return new File(imageFile.getParentFile(), base + "_mask.png");
+        return new File(getImageOutputDir(imageFile), base + "_mask.png");
     }
 
     private File buildMaskPropertiesOutputFile(File imageFile) {
         String name = imageFile.getName();
         int dot = name.lastIndexOf('.');
         String base = dot > 0 ? name.substring(0, dot) : name;
-        return new File(imageFile.getParentFile(), base + "_mask_properties.csv");
+        return new File(getImageOutputDir(imageFile), base + "_mask_properties.csv");
     }
 
-    private void writeMaskPropertiesCsv(BufferedImage rawMask, File csvFile) throws IOException {
+    private ImageCellStats writeMaskPropertiesCsv(BufferedImage rawMask, File csvFile, String imageName) throws IOException {
         int width = rawMask.getWidth();
         int height = rawMask.getHeight();
         Raster raster = rawMask.getRaster();
 
         Map<Integer, MaskPropertiesAccumulator> statsByLabel = new TreeMap<>();
 
+        // First pass: accumulate area, centroid sums, bbox
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 int label = getMaskLabel(raster, x, y);
@@ -1091,30 +1193,35 @@ public class CellposeFrontendUI {
             }
         }
 
+        // Second pass: accumulate second-order moments (for eccentricity) and boundary pixels
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 int label = getMaskLabel(raster, x, y);
                 if (label <= 0) {
                     continue;
                 }
-                if (isBoundaryPixel(raster, width, height, x, y, label)) {
-                    MaskPropertiesAccumulator stats = statsByLabel.get(label);
-                    if (stats != null) {
+                MaskPropertiesAccumulator stats = statsByLabel.get(label);
+                if (stats != null) {
+                    stats.sumXX += (double) x * x;
+                    stats.sumYY += (double) y * y;
+                    stats.sumXY += (double) x * y;
+                    if (isBoundaryPixel(raster, width, height, x, y, label)) {
                         stats.boundaryPixels++;
                     }
                 }
             }
         }
 
+        // Write per-cell CSV
         try (PrintWriter writer = new PrintWriter(new OutputStreamWriter(
             new FileOutputStream(csvFile),
             StandardCharsets.UTF_8
         ))) {
-            writer.println("label,area_pixels,centroid_x,centroid_y,bbox_min_x,bbox_min_y,bbox_max_x,bbox_max_y,boundary_pixels");
+            writer.println("label,area_pixels,centroid_x,centroid_y,bbox_min_x,bbox_min_y,bbox_max_x,bbox_max_y,boundary_pixels,equivalent_diameter,eccentricity");
             for (MaskPropertiesAccumulator stats : statsByLabel.values()) {
                 writer.println(String.format(
                     Locale.US,
-                    "%d,%d,%.4f,%.4f,%d,%d,%d,%d,%d",
+                    "%d,%d,%.4f,%.4f,%d,%d,%d,%d,%d,%.4f,%.4f",
                     stats.label,
                     stats.area,
                     stats.centroidX(),
@@ -1123,10 +1230,88 @@ public class CellposeFrontendUI {
                     stats.minY,
                     stats.maxX,
                     stats.maxY,
-                    stats.boundaryPixels
+                    stats.boundaryPixels,
+                    stats.equivalentDiameter(),
+                    stats.eccentricity()
                 ));
             }
         }
+
+        // Compute per-image summary
+        if (statsByLabel.isEmpty()) {
+            return new ImageCellStats(imageName, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        double totalArea = 0, totalDiam = 0, totalEcc = 0;
+        double minA = Double.MAX_VALUE, maxA = 0;
+        double minD = Double.MAX_VALUE, maxD = 0;
+
+        for (MaskPropertiesAccumulator stats : statsByLabel.values()) {
+            double a = stats.area;
+            double d = stats.equivalentDiameter();
+            double e = stats.eccentricity();
+            totalArea += a;
+            totalDiam += d;
+            totalEcc  += e;
+            if (a < minA) { minA = a; }
+            if (a > maxA) { maxA = a; }
+            if (d < minD) { minD = d; }
+            if (d > maxD) { maxD = d; }
+        }
+
+        int n = statsByLabel.size();
+        return new ImageCellStats(imageName, n,
+            totalArea / n, minA, maxA,
+            totalDiam / n, minD, maxD,
+            totalEcc / n);
+    }
+
+    /**
+     * Write overall_properties.csv with one row per image and a summary row.
+     */
+    private void writeOverallPropertiesCsv(List<ImageCellStats> allStats, File csvFile) throws IOException {
+        try (PrintWriter writer = new PrintWriter(new OutputStreamWriter(
+            new FileOutputStream(csvFile), StandardCharsets.UTF_8
+        ))) {
+            writer.println("image,cell_count,avg_area,min_area,max_area,min_diameter,max_diameter,avg_diameter,avg_eccentricity");
+
+            double sumAvgArea = 0, sumAvgDiam = 0, sumAvgEcc = 0;
+            double globalMinArea = Double.MAX_VALUE, globalMaxArea = 0;
+            double globalMinDiam = Double.MAX_VALUE, globalMaxDiam = 0;
+            int totalCells = 0;
+
+            for (ImageCellStats s : allStats) {
+                writer.println(String.format(Locale.US,
+                    "%s,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                    s.imageName, s.cellCount,
+                    s.avgArea, s.minArea, s.maxArea,
+                    s.minDiameter, s.maxDiameter, s.avgDiameter,
+                    s.avgEccentricity
+                ));
+
+                totalCells += s.cellCount;
+                sumAvgArea += s.avgArea;
+                sumAvgDiam += s.avgDiameter;
+                sumAvgEcc  += s.avgEccentricity;
+                if (s.minArea < globalMinArea) { globalMinArea = s.minArea; }
+                if (s.maxArea > globalMaxArea) { globalMaxArea = s.maxArea; }
+                if (s.minDiameter < globalMinDiam) { globalMinDiam = s.minDiameter; }
+                if (s.maxDiameter > globalMaxDiam) { globalMaxDiam = s.maxDiameter; }
+            }
+
+            // Summary row — cell_count is total cells across all images
+            int n = allStats.size();
+            writer.println(String.format(Locale.US,
+                "OVERALL,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                totalCells,
+                sumAvgArea / n,
+                globalMinArea, globalMaxArea,
+                globalMinDiam, globalMaxDiam,
+                sumAvgDiam / n,
+                sumAvgEcc / n
+            ));
+        }
+        System.out.println("[Cellpose] Saved overall properties: " + csvFile.getAbsolutePath());
     }
 
     private int getMaskLabel(Raster raster, int x, int y) {
