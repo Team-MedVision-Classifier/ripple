@@ -136,12 +136,16 @@ public class CellposeFrontendUI {
     private JSpinner fociChannelSpinner;
     private JButton classifyButton;
     private JCheckBox showClassificationCheckbox;
+    private JCheckBox showLabelsCheckbox;
     private JLabel classificationSummaryLabel;
     private BufferedImage classificationOverlay;
     private boolean showClassification = true;
+    private boolean showLabels = false;
     private File lastSavedMaskFile;
     // Maps cell label -> classification result: {prediction, probability, bbox}
     private Map<Integer, JSONObject> classificationResults = new HashMap<>();
+    // Maps cell label -> centroid (x,y) from segmentation mask; available after segmentation
+    private Map<Integer, int[]> cellCentroids = new HashMap<>();
     
     public CellposeFrontendUI(String backendUrl) {
         // Find backend directory
@@ -309,49 +313,24 @@ public class CellposeFrontendUI {
         
         panel.add(paramPanel);
         panel.add(Box.createRigidArea(new Dimension(0, 10)));
-        
-        // Display settings
-        JPanel displaySettingsPanel = createSection("Display Settings");
-        
-        showMaskCheckbox = new JCheckBox("Show Mask Overlay", true);
-        showMaskCheckbox.addActionListener(e -> {
-            showMask = showMaskCheckbox.isSelected();
-            updateDisplay();
-        });
-        displaySettingsPanel.add(showMaskCheckbox);
-        
-        displaySettingsPanel.add(Box.createRigidArea(new Dimension(0, 10)));
-        displaySettingsPanel.add(new JLabel("Mask Opacity:"));
-        opacitySlider = new JSlider(0, 100, 50);
-        opacitySlider.setMajorTickSpacing(25);
-        opacitySlider.setPaintTicks(true);
-        opacitySlider.setPaintLabels(true);
-        opacitySlider.addChangeListener(e -> {
-            maskOpacity = opacitySlider.getValue() / 100.0f;
-            updateDisplay();
-        });
-        displaySettingsPanel.add(opacitySlider);
-        
-        panel.add(displaySettingsPanel);
-        panel.add(Box.createRigidArea(new Dimension(0, 10)));
-        
+
         // Run segmentation
         JPanel actionPanel = createSection("Actions");
-        
+
         segmentButton = new JButton("Run Segmentation");
         segmentButton.setFont(new Font("Arial", Font.BOLD, 14));
         segmentButton.setAlignmentX(Component.LEFT_ALIGNMENT);
         segmentButton.addActionListener(e -> runSegmentation());
         actionPanel.add(segmentButton);
-        
+
         actionPanel.add(Box.createRigidArea(new Dimension(0, 10)));
-        
+
         progressBar = new JProgressBar();
         progressBar.setStringPainted(true);
         progressBar.setString("Ready");
         progressBar.setAlignmentX(Component.LEFT_ALIGNMENT);
         actionPanel.add(progressBar);
-        
+
         panel.add(actionPanel);
         panel.add(Box.createRigidArea(new Dimension(0, 10)));
 
@@ -381,15 +360,6 @@ public class CellposeFrontendUI {
         classifyButton.addActionListener(e -> runClassification());
         classificationPanel.add(classifyButton);
 
-        classificationPanel.add(Box.createRigidArea(new Dimension(0, 10)));
-
-        showClassificationCheckbox = new JCheckBox("Show Classification Overlay", true);
-        showClassificationCheckbox.addActionListener(e -> {
-            showClassification = showClassificationCheckbox.isSelected();
-            updateDisplay();
-        });
-        classificationPanel.add(showClassificationCheckbox);
-
         classificationPanel.add(Box.createRigidArea(new Dimension(0, 5)));
 
         classificationSummaryLabel = new JLabel("No classification results");
@@ -398,6 +368,45 @@ public class CellposeFrontendUI {
         classificationPanel.add(classificationSummaryLabel);
 
         panel.add(classificationPanel);
+        panel.add(Box.createRigidArea(new Dimension(0, 10)));
+
+        // Display settings (after classification so all overlay options are together)
+        JPanel displaySettingsPanel = createSection("Display Settings");
+
+        showMaskCheckbox = new JCheckBox("Show Mask Overlay", true);
+        showMaskCheckbox.addActionListener(e -> {
+            showMask = showMaskCheckbox.isSelected();
+            updateDisplay();
+        });
+        displaySettingsPanel.add(showMaskCheckbox);
+
+        showClassificationCheckbox = new JCheckBox("Show Classification Overlay", true);
+        showClassificationCheckbox.addActionListener(e -> {
+            showClassification = showClassificationCheckbox.isSelected();
+            updateDisplay();
+        });
+        displaySettingsPanel.add(showClassificationCheckbox);
+
+        showLabelsCheckbox = new JCheckBox("Show Cell Labels", false);
+        showLabelsCheckbox.addActionListener(e -> {
+            showLabels = showLabelsCheckbox.isSelected();
+            updateDisplay();
+        });
+        displaySettingsPanel.add(showLabelsCheckbox);
+
+        displaySettingsPanel.add(Box.createRigidArea(new Dimension(0, 10)));
+        displaySettingsPanel.add(new JLabel("Mask Opacity:"));
+        opacitySlider = new JSlider(0, 100, 50);
+        opacitySlider.setMajorTickSpacing(25);
+        opacitySlider.setPaintTicks(true);
+        opacitySlider.setPaintLabels(true);
+        opacitySlider.addChangeListener(e -> {
+            maskOpacity = opacitySlider.getValue() / 100.0f;
+            updateDisplay();
+        });
+        displaySettingsPanel.add(opacitySlider);
+
+        panel.add(displaySettingsPanel);
         panel.add(Box.createVerticalGlue());
 
         return panel;
@@ -778,6 +787,7 @@ public class CellposeFrontendUI {
                 maskImage = null;
                 classificationOverlay = null;
                 classificationResults.clear();
+                cellCentroids.clear();
                 if (classificationSummaryLabel != null) {
                     classificationSummaryLabel.setText("No classification results");
                 }
@@ -920,6 +930,14 @@ public class CellposeFrontendUI {
             protected void done() {
                 try {
                     maskImage = get();
+                    // Compute cell centroids from the saved mask for label display
+                    classificationOverlay = null;
+                    classificationResults.clear();
+                    cellCentroids.clear();
+                    File maskFile = currentImageFile != null ? buildMaskOutputFile(currentImageFile) : null;
+                    if (maskFile != null && maskFile.exists()) {
+                        computeCellCentroidsFromMask(maskFile);
+                    }
                     updateDisplay();
 
                     if (taskIsFolderBatch) {
@@ -1331,6 +1349,35 @@ public class CellposeFrontendUI {
             g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, maskOpacity));
             g.drawImage(classificationOverlay, 0, 0, null);
         }
+
+        // Draw cell label numbers at each cell's centroid (available after segmentation)
+        if (showLabels && !cellCentroids.isEmpty()) {
+            g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 1.0f));
+            int fontSize = Math.max(10, Math.min(16, originalImage.getWidth() / 80));
+            g.setFont(new Font("Arial", Font.BOLD, fontSize));
+            g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
+                               RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            FontMetrics fm = g.getFontMetrics();
+
+            for (Map.Entry<Integer, int[]> entry : cellCentroids.entrySet()) {
+                int label = entry.getKey();
+                int[] centroid = entry.getValue();
+                int cx = centroid[0];
+                int cy = centroid[1];
+
+                String text = String.valueOf(label);
+                int tw = fm.stringWidth(text);
+                int th = fm.getAscent();
+
+                // Draw background pill for readability
+                g.setColor(new Color(0, 0, 0, 160));
+                g.fillRoundRect(cx - tw / 2 - 3, cy - th / 2 - 2, tw + 6, th + 4, 6, 6);
+
+                // Draw label number
+                g.setColor(Color.WHITE);
+                g.drawString(text, cx - tw / 2, cy + th / 2 - 1);
+            }
+        }
         g.dispose();
         
         // Apply zoom
@@ -1635,6 +1682,51 @@ public class CellposeFrontendUI {
     /**
      * Find the mask file corresponding to the current image.
      */
+    /**
+     * Compute cell centroids from a segmentation mask image.
+     * Scans the label image and calculates the mean (x, y) for each label.
+     */
+    private void computeCellCentroidsFromMask(File maskFile) {
+        try {
+            BufferedImage maskImg = ImageIO.read(maskFile);
+            if (maskImg == null) {
+                return;
+            }
+
+            int width = maskImg.getWidth();
+            int height = maskImg.getHeight();
+            Raster raster = maskImg.getRaster();
+
+            // Accumulate sums per label
+            Map<Integer, long[]> accum = new HashMap<>(); // label -> {sumX, sumY, count}
+
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    int label = raster.getNumBands() > 0 ? raster.getSample(x, y, 0) : 0;
+                    if (label <= 0) {
+                        continue;
+                    }
+                    long[] sums = accum.computeIfAbsent(label, k -> new long[3]);
+                    sums[0] += x;
+                    sums[1] += y;
+                    sums[2]++;
+                }
+            }
+
+            cellCentroids.clear();
+            for (Map.Entry<Integer, long[]> entry : accum.entrySet()) {
+                long[] sums = entry.getValue();
+                int cx = (int) (sums[0] / sums[2]);
+                int cy = (int) (sums[1] / sums[2]);
+                cellCentroids.put(entry.getKey(), new int[]{cx, cy});
+            }
+
+            System.out.println("[Cellpose] Computed centroids for " + cellCentroids.size() + " cells");
+        } catch (Exception e) {
+            System.err.println("[Cellpose] Failed to compute centroids: " + e.getMessage());
+        }
+    }
+
     private File findMaskFileForCurrentImage() {
         if (currentImageFile == null) {
             return null;
