@@ -191,6 +191,8 @@ public class CellposeFrontendUI {
     private JCheckBox showMaskCheckbox;
     private JSlider opacitySlider;
     private JButton segmentButton;
+    private JButton segmentAllButton;
+    private JLabel segmentationSummaryLabel;
     private JProgressBar progressBar;
     
     // Color map for mask visualization
@@ -200,6 +202,7 @@ public class CellposeFrontendUI {
     private JComboBox<String> classificationMethodCombo;
     private JSpinner fociChannelSpinner;
     private JButton classifyButton;
+    private JButton classifyAllButton;
     private JCheckBox showClassificationCheckbox;
     private JCheckBox showLabelsCheckbox;
     private JCheckBox showFociMaskCheckbox;
@@ -209,7 +212,6 @@ public class CellposeFrontendUI {
     private boolean showClassification = true;
     private boolean showLabels = false;
     private boolean showFociMask = false;
-    private File lastSavedMaskFile;
     private JPanel methodOptionsCards;
     private CardLayout methodOptionsLayout;
 
@@ -398,13 +400,27 @@ public class CellposeFrontendUI {
         // Run segmentation
         JPanel actionPanel = createSection("Actions");
 
+        JPanel segButtonRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        segButtonRow.setAlignmentX(Component.LEFT_ALIGNMENT);
         segmentButton = new JButton("Run Segmentation");
-        segmentButton.setFont(new Font("Arial", Font.BOLD, 14));
-        segmentButton.setAlignmentX(Component.LEFT_ALIGNMENT);
+        segmentButton.setFont(new Font("Arial", Font.BOLD, 13));
         segmentButton.addActionListener(e -> runSegmentation());
-        actionPanel.add(segmentButton);
+        segmentAllButton = new JButton("Segment All");
+        segmentAllButton.setFont(new Font("Arial", Font.BOLD, 13));
+        segmentAllButton.setEnabled(false);
+        segmentAllButton.addActionListener(e -> runBatchSegmentation());
+        segButtonRow.add(segmentButton);
+        segButtonRow.add(segmentAllButton);
+        actionPanel.add(segButtonRow);
 
-        actionPanel.add(Box.createRigidArea(new Dimension(0, 10)));
+        actionPanel.add(Box.createRigidArea(new Dimension(0, 5)));
+
+        segmentationSummaryLabel = new JLabel("No segmentation results");
+        segmentationSummaryLabel.setFont(new Font("Arial", Font.PLAIN, 11));
+        segmentationSummaryLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        actionPanel.add(segmentationSummaryLabel);
+
+        actionPanel.add(Box.createRigidArea(new Dimension(0, 5)));
 
         progressBar = new JProgressBar();
         progressBar.setStringPainted(true);
@@ -477,11 +493,18 @@ public class CellposeFrontendUI {
 
         classificationPanel.add(Box.createRigidArea(new Dimension(0, 10)));
 
+        JPanel classifyButtonRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        classifyButtonRow.setAlignmentX(Component.LEFT_ALIGNMENT);
         classifyButton = new JButton("Run Classification");
-        classifyButton.setFont(new Font("Arial", Font.BOLD, 14));
-        classifyButton.setAlignmentX(Component.LEFT_ALIGNMENT);
+        classifyButton.setFont(new Font("Arial", Font.BOLD, 13));
         classifyButton.addActionListener(e -> runClassification());
-        classificationPanel.add(classifyButton);
+        classifyAllButton = new JButton("Classify All");
+        classifyAllButton.setFont(new Font("Arial", Font.BOLD, 13));
+        classifyAllButton.setEnabled(false);
+        classifyAllButton.addActionListener(e -> runBatchClassification());
+        classifyButtonRow.add(classifyButton);
+        classifyButtonRow.add(classifyAllButton);
+        classificationPanel.add(classifyButtonRow);
 
         classificationPanel.add(Box.createRigidArea(new Dimension(0, 5)));
 
@@ -816,6 +839,8 @@ public class CellposeFrontendUI {
                 currentFolder = null;
                 folderFileListModel.clear();
                 setFolderListVisible(false);
+                segmentAllButton.setEnabled(false);
+                classifyAllButton.setEnabled(false);
                 statusLabel.setText(" Loaded: " + file.getName());
             }
         }
@@ -853,6 +878,8 @@ public class CellposeFrontendUI {
             folderFileListModel.addElement(candidate);
         }
         setFolderListVisible(true);
+        segmentAllButton.setEnabled(true);
+        classifyAllButton.setEnabled(true);
         folderFileList.setSelectedIndex(0);
         folderFileList.ensureIndexIsVisible(0);
     }
@@ -915,7 +942,6 @@ public class CellposeFrontendUI {
 
             if (originalImage != null) {
                 currentImageFile = file;
-                maskImage = null;
                 classificationOverlay = null;
                 fociMaskImage = null;
                 classificationResults.clear();
@@ -923,6 +949,26 @@ public class CellposeFrontendUI {
                 if (classificationSummaryLabel != null) {
                     classificationSummaryLabel.setText("No classification results");
                 }
+
+                // Try to reload existing mask from outputs folder
+                maskImage = null;
+                File existingMask = buildMaskOutputFile(file);
+                if (existingMask.exists()) {
+                    try {
+                        BufferedImage rawMask = ImageIO.read(existingMask);
+                        if (rawMask != null) {
+                            int[] numCellsOut = new int[]{0};
+                            maskImage = createColoredMaskFromLabels(rawMask, numCellsOut);
+                            computeCellCentroidsFromMask(existingMask);
+                        }
+                    } catch (Exception ex) {
+                        System.err.println("[Cellpose] Could not reload mask: " + ex.getMessage());
+                    }
+                }
+
+                // Try to reload existing classification from outputs folder
+                reloadClassificationResults(file, existingMask);
+
                 zoomFit();
                 return true;
             }
@@ -940,47 +986,64 @@ public class CellposeFrontendUI {
     }
     
     /**
-     * Run segmentation by directly executing Cellpose CLI.
+     * Run segmentation for the current single image only.
      */
     private void runSegmentation() {
-        if (originalImage == null) {
+        if (currentImageFile == null || originalImage == null) {
             JOptionPane.showMessageDialog(frame,
                 "Please load an image first.",
                 "No Image", JOptionPane.WARNING_MESSAGE);
             return;
         }
+        List<File> singleFile = new ArrayList<>();
+        singleFile.add(currentImageFile);
+        executeSegmentationBatch(singleFile, false);
+    }
 
-        List<File> filesToProcess = getFilesForSegmentation();
-        if (filesToProcess.isEmpty()) {
+    /**
+     * Run segmentation for all images in the opened folder.
+     */
+    private void runBatchSegmentation() {
+        if (currentFolder == null || folderFileListModel == null || folderFileListModel.getSize() == 0) {
             JOptionPane.showMessageDialog(frame,
-                "No valid images available for segmentation.",
+                "Please open a folder first.",
+                "No Folder", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        List<File> files = getFilesForSegmentation();
+        if (files.isEmpty()) {
+            JOptionPane.showMessageDialog(frame,
+                "No valid images found in folder.",
                 "No Images", JOptionPane.WARNING_MESSAGE);
             return;
         }
 
-        boolean isFolderBatch = currentFolder != null && filesToProcess.size() > 1;
-        if (isFolderBatch) {
-            int confirm = JOptionPane.showConfirmDialog(
-                frame,
-                "Run segmentation for all " + filesToProcess.size() + " images in this folder?\n"
-                    + "Output files will be saved next to each image as <name>_mask.png",
-                "Batch Segmentation",
-                JOptionPane.OK_CANCEL_OPTION,
-                JOptionPane.QUESTION_MESSAGE
-            );
-            if (confirm != JOptionPane.OK_OPTION) {
-                return;
-            }
+        int confirm = JOptionPane.showConfirmDialog(frame,
+            "Run segmentation for all " + files.size() + " images in this folder?",
+            "Batch Segmentation",
+            JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
+        if (confirm != JOptionPane.OK_OPTION) {
+            return;
         }
 
-        final List<File> taskFiles = new ArrayList<>(filesToProcess);
-        final boolean taskIsFolderBatch = isFolderBatch;
-        
-        segmentButton.setEnabled(false);
+        executeSegmentationBatch(files, true);
+    }
+
+    /**
+     * Core segmentation worker shared by single and batch modes.
+     */
+    private void executeSegmentationBatch(List<File> taskFiles, boolean isBatch) {
+        if (isBatch) {
+            segmentAllButton.setEnabled(false);
+        } else {
+            segmentButton.setEnabled(false);
+        }
         progressBar.setIndeterminate(true);
         progressBar.setString("Running segmentation...");
         statusLabel.setText(" Running segmentation...");
-        
+        segmentationSummaryLabel.setText("Segmenting...");
+
         SwingWorker<BufferedImage, String> worker = new SwingWorker<>() {
             private int savedMasksCount = 0;
             private int noMasksCount = 0;
@@ -1050,8 +1113,8 @@ public class CellposeFrontendUI {
                     }
                 }
 
-                // Write overall_properties.csv at the outputs/ folder level
-                if (!allImageStats.isEmpty() && taskIsFolderBatch) {
+                // Write overall_properties.csv at the outputs/ folder level for batch
+                if (!allImageStats.isEmpty() && isBatch) {
                     File outputsRoot = getOutputsRootDir(taskFiles.get(0));
                     writeOverallPropertiesCsv(allImageStats, new File(outputsRoot, "overall_properties.csv"));
                     publish("Saved overall_properties.csv");
@@ -1059,19 +1122,18 @@ public class CellposeFrontendUI {
 
                 return previewMask;
             }
-            
+
             @Override
             protected void process(java.util.List<String> chunks) {
                 for (String msg : chunks) {
                     statusLabel.setText(" " + msg);
                 }
             }
-            
+
             @Override
             protected void done() {
                 try {
                     maskImage = get();
-                    // Compute cell centroids from the saved mask for label display
                     classificationOverlay = null;
                     classificationResults.clear();
                     cellCentroids.clear();
@@ -1081,29 +1143,37 @@ public class CellposeFrontendUI {
                     }
                     updateDisplay();
 
-                    if (taskIsFolderBatch) {
+                    String summaryText;
+                    if (isBatch) {
                         String folderName = currentFolder != null ? currentFolder.getName() : "folder";
-                        statusLabel.setText(" Segmentation completed for " + taskFiles.size()
-                            + " images in " + folderName + ": "
-                            + savedMasksCount + " saved, " + noMasksCount + " with no masks");
+                        summaryText = savedMasksCount + " segmented, " + noMasksCount + " no masks ("
+                            + taskFiles.size() + " images in " + folderName + ")";
                     } else if (noMasksCount > 0 && currentImageFile != null) {
-                        statusLabel.setText(" No masks found for " + currentImageFile.getName());
+                        summaryText = "No masks found for " + currentImageFile.getName();
                     } else if (currentImageFile != null) {
-                        statusLabel.setText(" Segmentation completed: " + currentImageFile.getName());
+                        int cellCount = cellCentroids.size();
+                        summaryText = currentImageFile.getName() + ": " + cellCount + " cells segmented";
                     } else {
-                        statusLabel.setText(" Segmentation completed");
+                        summaryText = "Segmentation completed";
                     }
+                    segmentationSummaryLabel.setText(summaryText);
+                    statusLabel.setText(" " + summaryText);
 
                     progressBar.setString("Completed");
                 } catch (Exception e) {
                     statusLabel.setText(" Segmentation failed: " + e.getMessage());
+                    segmentationSummaryLabel.setText("Segmentation failed");
                     progressBar.setString("Failed");
                     JOptionPane.showMessageDialog(frame,
                         "Segmentation error: " + e.getMessage(),
                         "Error", JOptionPane.ERROR_MESSAGE);
                 }
                 progressBar.setIndeterminate(false);
-                segmentButton.setEnabled(true);
+                if (isBatch) {
+                    segmentAllButton.setEnabled(true);
+                } else {
+                    segmentButton.setEnabled(true);
+                }
             }
         };
         worker.execute();
@@ -1765,10 +1835,10 @@ public class CellposeFrontendUI {
     }
 
     /**
-     * Run DINO foci classification on the currently segmented image.
+     * Run classification for the current single image only.
      */
     private void runClassification() {
-        if (originalImage == null) {
+        if (currentImageFile == null || originalImage == null) {
             JOptionPane.showMessageDialog(frame,
                 "Please load an image first.",
                 "No Image", JOptionPane.WARNING_MESSAGE);
@@ -1783,98 +1853,235 @@ public class CellposeFrontendUI {
             return;
         }
 
+        classifyButton.setEnabled(false);
+        classificationSummaryLabel.setText("Classifying...");
+        executeSingleClassification(currentImageFile, maskFile, true);
+    }
+
+    /**
+     * Run classification for all images in the opened folder.
+     */
+    private void runBatchClassification() {
+        if (currentFolder == null || folderFileListModel == null || folderFileListModel.getSize() == 0) {
+            JOptionPane.showMessageDialog(frame,
+                "Please open a folder first.",
+                "No Folder", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        // Collect all images that have masks
+        List<File> filesToClassify = new ArrayList<>();
+        List<File> missingMasks = new ArrayList<>();
+        for (int i = 0; i < folderFileListModel.getSize(); i++) {
+            File file = folderFileListModel.getElementAt(i);
+            File mask = buildMaskOutputFile(file);
+            if (mask.exists()) {
+                filesToClassify.add(file);
+            } else {
+                missingMasks.add(file);
+            }
+        }
+
+        if (filesToClassify.isEmpty()) {
+            JOptionPane.showMessageDialog(frame,
+                "No segmentation masks found.\nPlease run 'Segment All' first.",
+                "No Masks", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        String msg = "Classify " + filesToClassify.size() + " images?";
+        if (!missingMasks.isEmpty()) {
+            msg += "\n(" + missingMasks.size() + " images have no mask and will be skipped)";
+        }
+        int confirm = JOptionPane.showConfirmDialog(frame, msg,
+            "Batch Classification", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
+        if (confirm != JOptionPane.OK_OPTION) {
+            return;
+        }
+
+        classifyAllButton.setEnabled(false);
+        statusLabel.setText(" Running batch classification...");
+        classificationSummaryLabel.setText("Classifying...");
+
         String method = (String) classificationMethodCombo.getSelectedItem();
         int fociChannel = ((Number) fociChannelSpinner.getValue()).intValue();
 
-        if ("DINO".equals(method)) {
-            runDinoClassification(maskFile, fociChannel);
-        } else {
-            runThresholdClassification(maskFile, fociChannel);
-        }
-    }
-
-    private void runDinoClassification(File maskFile, int fociChannel) {
+        // Capture threshold params now (on EDT)
         String selectedModel = (String) classificationModelCombo.getSelectedItem();
-        if (selectedModel == null || selectedModel.startsWith("(")) {
-            JOptionPane.showMessageDialog(frame,
-                "No classification model selected.\n"
-                + "Please place a .pth model file in:\n"
-                + (modelsDir != null ? modelsDir.resolve("DINO").toString() : "models/DINO/"),
-                "No Model", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-
-        Path modelPath = modelsDir.resolve("DINO").resolve(selectedModel);
-        if (!modelPath.toFile().exists()) {
-            JOptionPane.showMessageDialog(frame,
-                "Model file not found: " + modelPath,
-                "Missing Model", JOptionPane.ERROR_MESSAGE);
-            return;
-        }
-
-        classifyButton.setEnabled(false);
-        statusLabel.setText(" Running DINO classification (channel=" + fociChannel + ")...");
-        classificationSummaryLabel.setText("Classifying...");
-
-        SwingWorker<JSONObject, String> worker = new SwingWorker<>() {
-            @Override
-            protected JSONObject doInBackground() throws Exception {
-                return executeDinoClassification(
-                    currentImageFile, maskFile, modelPath.toFile(), fociChannel
-                );
-            }
-
-            @Override
-            protected void done() {
-                try {
-                    processClassificationResult(get(), maskFile);
-                } catch (Exception e) {
-                    statusLabel.setText(" Classification failed: " + e.getMessage());
-                    classificationSummaryLabel.setText("Error");
-                    e.printStackTrace();
-                    classifyButton.setEnabled(true);
-                }
-            }
-        };
-        worker.execute();
-    }
-
-    private void runThresholdClassification(File maskFile, int fociChannel) {
+        Path modelPath = (modelsDir != null && selectedModel != null && !selectedModel.startsWith("("))
+            ? modelsDir.resolve("DINO").resolve(selectedModel) : null;
         int denoiseH = ((Number) denoiseHSpinner.getValue()).intValue();
         int tophatSize = ((Number) tophatSizeSpinner.getValue()).intValue();
         double clipLimit = ((Number) clipLimitSpinner.getValue()).doubleValue();
         int minArea = ((Number) minAreaSpinner.getValue()).intValue();
         int damageThreshold = ((Number) damageThresholdSpinner.getValue()).intValue();
 
-        classifyButton.setEnabled(false);
-        statusLabel.setText(" Running threshold classification (channel=" + fociChannel + ")...");
-        classificationSummaryLabel.setText("Classifying...");
+        SwingWorker<Void, String> worker = new SwingWorker<>() {
+            private int classified = 0;
+            private int errors = 0;
+            private int totalHealthy = 0;
+            private int totalDamaged = 0;
 
-        SwingWorker<JSONObject, String> worker = new SwingWorker<>() {
             @Override
-            protected JSONObject doInBackground() throws Exception {
-                return executeThresholdClassification(
-                    currentImageFile, maskFile, fociChannel,
-                    denoiseH, tophatSize, clipLimit, minArea, damageThreshold
-                );
+            protected Void doInBackground() throws Exception {
+                int total = filesToClassify.size();
+                for (int i = 0; i < total; i++) {
+                    File imageFile = filesToClassify.get(i);
+                    File maskFile = buildMaskOutputFile(imageFile);
+                    publish("[" + (i + 1) + "/" + total + "] Classifying " + imageFile.getName() + "...");
+
+                    JSONObject result;
+                    try {
+                        if ("DINO".equals(method)) {
+                            if (modelPath == null || !modelPath.toFile().exists()) {
+                                throw new Exception("DINO model not found");
+                            }
+                            result = executeDinoClassification(imageFile, maskFile, modelPath.toFile(), fociChannel);
+                        } else {
+                            result = executeThresholdClassification(imageFile, maskFile, fociChannel,
+                                denoiseH, tophatSize, clipLimit, minArea, damageThreshold);
+                        }
+                    } catch (Exception e) {
+                        errors++;
+                        publish("Error classifying " + imageFile.getName() + ": " + e.getMessage());
+                        continue;
+                    }
+
+                    if (result.has("error")) {
+                        errors++;
+                        publish("Error: " + result.getString("error"));
+                        continue;
+                    }
+
+                    // Save results
+                    saveClassificationCsv(imageFile, result);
+                    JSONObject summary = result.getJSONObject("summary");
+                    totalHealthy += summary.getInt("healthy");
+                    totalDamaged += summary.getInt("damaged");
+                    classified++;
+                    publish("Classified " + imageFile.getName()
+                        + " (" + summary.getInt("healthy") + " healthy, "
+                        + summary.getInt("damaged") + " damaged)");
+                }
+                return null;
+            }
+
+            @Override
+            protected void process(java.util.List<String> chunks) {
+                for (String m : chunks) {
+                    statusLabel.setText(" " + m);
+                }
             }
 
             @Override
             protected void done() {
                 try {
-                    processClassificationResult(get(), maskFile);
+                    get();
+                    String summaryText = String.format(
+                        "Batch: %d classified | Healthy: %d | Damaged: %d | Errors: %d",
+                        classified, totalHealthy, totalDamaged, errors);
+                    classificationSummaryLabel.setText(summaryText);
+                    statusLabel.setText(" " + summaryText);
+
+                    // Reload overlay for currently viewed image
+                    if (currentImageFile != null) {
+                        File maskFile = buildMaskOutputFile(currentImageFile);
+                        reloadClassificationResults(currentImageFile, maskFile);
+                        updateDisplay();
+                    }
                 } catch (Exception e) {
-                    statusLabel.setText(" Classification failed: " + e.getMessage());
+                    statusLabel.setText(" Batch classification failed: " + e.getMessage());
                     classificationSummaryLabel.setText("Error");
                     e.printStackTrace();
-                    classifyButton.setEnabled(true);
                 }
+                classifyAllButton.setEnabled(true);
             }
         };
         worker.execute();
     }
 
-    private void processClassificationResult(JSONObject result, File maskFile) {
+    /**
+     * Execute classification for a single image and update display.
+     */
+    private void executeSingleClassification(File imageFile, File maskFile, boolean updateUi) {
+        String method = (String) classificationMethodCombo.getSelectedItem();
+        int fociChannel = ((Number) fociChannelSpinner.getValue()).intValue();
+
+        if ("DINO".equals(method)) {
+            String selectedModel = (String) classificationModelCombo.getSelectedItem();
+            if (selectedModel == null || selectedModel.startsWith("(")) {
+                JOptionPane.showMessageDialog(frame,
+                    "No classification model selected.\n"
+                    + "Please place a .pth model file in:\n"
+                    + (modelsDir != null ? modelsDir.resolve("DINO").toString() : "models/DINO/"),
+                    "No Model", JOptionPane.WARNING_MESSAGE);
+                classifyButton.setEnabled(true);
+                return;
+            }
+            Path modelPath = modelsDir.resolve("DINO").resolve(selectedModel);
+            if (!modelPath.toFile().exists()) {
+                JOptionPane.showMessageDialog(frame,
+                    "Model file not found: " + modelPath,
+                    "Missing Model", JOptionPane.ERROR_MESSAGE);
+                classifyButton.setEnabled(true);
+                return;
+            }
+
+            statusLabel.setText(" Running DINO classification (channel=" + fociChannel + ")...");
+            SwingWorker<JSONObject, String> worker = new SwingWorker<>() {
+                @Override
+                protected JSONObject doInBackground() throws Exception {
+                    return executeDinoClassification(imageFile, maskFile, modelPath.toFile(), fociChannel);
+                }
+
+                @Override
+                protected void done() {
+                    try {
+                        processClassificationResult(get(), imageFile, maskFile, updateUi);
+                    } catch (Exception e) {
+                        statusLabel.setText(" Classification failed: " + e.getMessage());
+                        classificationSummaryLabel.setText("Error");
+                        e.printStackTrace();
+                        classifyButton.setEnabled(true);
+                    }
+                }
+            };
+            worker.execute();
+        } else {
+            int denoiseH = ((Number) denoiseHSpinner.getValue()).intValue();
+            int tophatSize = ((Number) tophatSizeSpinner.getValue()).intValue();
+            double clipLimit = ((Number) clipLimitSpinner.getValue()).doubleValue();
+            int minArea = ((Number) minAreaSpinner.getValue()).intValue();
+            int damageThreshold = ((Number) damageThresholdSpinner.getValue()).intValue();
+
+            statusLabel.setText(" Running threshold classification (channel=" + fociChannel + ")...");
+            SwingWorker<JSONObject, String> worker = new SwingWorker<>() {
+                @Override
+                protected JSONObject doInBackground() throws Exception {
+                    return executeThresholdClassification(imageFile, maskFile, fociChannel,
+                        denoiseH, tophatSize, clipLimit, minArea, damageThreshold);
+                }
+
+                @Override
+                protected void done() {
+                    try {
+                        processClassificationResult(get(), imageFile, maskFile, updateUi);
+                    } catch (Exception e) {
+                        statusLabel.setText(" Classification failed: " + e.getMessage());
+                        classificationSummaryLabel.setText("Error");
+                        e.printStackTrace();
+                        classifyButton.setEnabled(true);
+                    }
+                }
+            };
+            worker.execute();
+        }
+    }
+
+    /**
+     * Process a single-image classification result.
+     */
+    private void processClassificationResult(JSONObject result, File imageFile, File maskFile, boolean updateUi) {
         if (result.has("error")) {
             String err = result.getString("error");
             statusLabel.setText(" Classification failed: " + err);
@@ -1917,10 +2124,83 @@ public class CellposeFrontendUI {
             classificationSummaryLabel.setText(summaryText);
             statusLabel.setText(" Classification complete: " + summaryText);
 
-            saveClassificationCsv(currentImageFile, result);
-            updateDisplay();
+            saveClassificationCsv(imageFile, result);
+            if (updateUi) {
+                updateDisplay();
+            }
         }
         classifyButton.setEnabled(true);
+    }
+
+    /**
+     * Reload classification results from CSV when switching tabs.
+     */
+    private void reloadClassificationResults(File imageFile, File maskFile) {
+        classificationOverlay = null;
+        fociMaskImage = null;
+        classificationResults.clear();
+
+        if (imageFile == null) {
+            return;
+        }
+
+        String name = imageFile.getName();
+        int dot = name.lastIndexOf('.');
+        String base = dot > 0 ? name.substring(0, dot) : name;
+        File csvFile = new File(getImageOutputDir(imageFile), base + "_classification.csv");
+
+        if (!csvFile.exists()) {
+            if (classificationSummaryLabel != null) {
+                classificationSummaryLabel.setText("No classification results");
+            }
+            return;
+        }
+
+        // Parse the classification CSV and rebuild overlay
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(csvFile), StandardCharsets.UTF_8))) {
+            String header = reader.readLine(); // skip header
+            if (header == null) {
+                return;
+            }
+
+            int healthy = 0, damaged = 0;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] parts = line.split(",");
+                if (parts.length < 7) {
+                    continue;
+                }
+                JSONObject cell = new JSONObject();
+                cell.put("label", Integer.parseInt(parts[0]));
+                cell.put("prediction", parts[1]);
+                cell.put("probability", Double.parseDouble(parts[2]));
+                JSONObject bbox = new JSONObject();
+                bbox.put("min_x", Integer.parseInt(parts[3]));
+                bbox.put("min_y", Integer.parseInt(parts[4]));
+                bbox.put("max_x", Integer.parseInt(parts[5]));
+                bbox.put("max_y", Integer.parseInt(parts[6]));
+                cell.put("bbox", bbox);
+                classificationResults.put(cell.getInt("label"), cell);
+
+                if ("Damaged".equals(parts[1])) {
+                    damaged++;
+                } else {
+                    healthy++;
+                }
+            }
+
+            if (!classificationResults.isEmpty() && maskFile != null && maskFile.exists()) {
+                buildClassificationOverlay(maskFile);
+                if (classificationSummaryLabel != null) {
+                    classificationSummaryLabel.setText(String.format(
+                        "Total: %d | Healthy: %d | Damaged: %d",
+                        classificationResults.size(), healthy, damaged));
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[Classify] Failed to reload classification: " + e.getMessage());
+        }
     }
 
     /**
@@ -2205,7 +2485,7 @@ public class CellposeFrontendUI {
             String name = imageFile.getName();
             int dot = name.lastIndexOf('.');
             String base = dot > 0 ? name.substring(0, dot) : name;
-            File csvFile = new File(imageFile.getParentFile(), base + "_classification.csv");
+            File csvFile = new File(getImageOutputDir(imageFile), base + "_classification.csv");
 
             try (PrintWriter writer = new PrintWriter(new OutputStreamWriter(
                     new FileOutputStream(csvFile), StandardCharsets.UTF_8))) {
